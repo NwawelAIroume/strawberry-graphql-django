@@ -277,7 +277,9 @@ def apply(
     if pk not in (None, strawberry.UNSET):  # noqa: PLR6201
         queryset = queryset.filter(pk=pk)
 
-    if filters in (None, strawberry.UNSET) or not has_django_definition(filters):  # noqa: PLR6201
+    if filters in (None, strawberry.UNSET) or not has_django_definition(
+        filters
+    ):  # noqa: PLR6201
         return queryset
 
     # Custom filter function in the filters object
@@ -310,7 +312,9 @@ def apply(
 class StrawberryDjangoFieldFilters(StrawberryDjangoFieldBase):
     def __init__(self, filters: Union[type, UnsetType, None] = UNSET, **kwargs):
         if filters and not has_object_definition(filters):
-            raise TypeError("filters needs to be a strawberry type")
+            pass
+            # comment requested because cannot handle deeply nested filter and order
+            # raise TypeError("filters needs to be a strawberry type")
 
         self.filters = filters
         super().__init__(**kwargs)

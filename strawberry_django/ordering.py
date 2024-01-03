@@ -197,7 +197,9 @@ def apply(
 class StrawberryDjangoFieldOrdering(StrawberryDjangoFieldBase):
     def __init__(self, order: type | UnsetType | None = UNSET, **kwargs):
         if order and not has_object_definition(order):
-            raise TypeError("order needs to be a strawberry type")
+            pass
+            # comment requested because cannot handle deeply nested filter and order
+            # raise TypeError("order needs to be a strawberry type")
 
         self.order = order
         super().__init__(**kwargs)

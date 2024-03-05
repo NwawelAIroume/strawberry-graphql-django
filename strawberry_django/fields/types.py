@@ -2,6 +2,7 @@ import datetime
 import decimal
 import enum
 import inspect
+import re
 import uuid
 from typing import (
     TYPE_CHECKING,
@@ -15,7 +16,6 @@ from typing import (
     Type,
     TypeVar,
     Union,
-    cast,
 )
 
 import django
@@ -65,33 +65,33 @@ class DjangoModelType:
 
 @strawberry.input
 class OneToOneInput:
-    set: Optional[strawberry.ID]  # noqa: A003
+    set: Optional[strawberry.ID]
 
 
 @strawberry.input
 class OneToManyInput:
-    set: Optional[strawberry.ID]  # noqa: A003
+    set: Optional[strawberry.ID]
 
 
 @strawberry.input
 class ManyToOneInput:
     add: Optional[List[strawberry.ID]] = UNSET
     remove: Optional[List[strawberry.ID]] = UNSET
-    set: Optional[List[strawberry.ID]] = UNSET  # noqa: A003
+    set: Optional[List[strawberry.ID]] = UNSET
 
 
 @strawberry.input
 class ManyToManyInput:
     add: Optional[List[strawberry.ID]] = UNSET
     remove: Optional[List[strawberry.ID]] = UNSET
-    set: Optional[List[strawberry.ID]] = UNSET  # noqa: A003
+    set: Optional[List[strawberry.ID]] = UNSET
 
 
 @strawberry.input(
     description="Input of an object that implements the `Node` interface.",
 )
 class NodeInput:
-    id: relay.GlobalID  # noqa: A003
+    id: relay.GlobalID
 
     def __eq__(self, other: object):
         if not isinstance(other, NodeInput):
@@ -110,9 +110,9 @@ class NodeInputPartial(NodeInput):
     # FIXME: Without this pyright will not let any class inherit from this and define
     # a field that doesn't contain a default value...
     if TYPE_CHECKING:
-        id: Optional[relay.GlobalID]  # type: ignore  # noqa: A003
+        id: Optional[relay.GlobalID]  # type: ignore
     else:
-        id: Optional[relay.GlobalID] = UNSET  # noqa: A003
+        id: Optional[relay.GlobalID] = UNSET
 
 
 @strawberry.input(description="Add/remove/set the selected nodes.")
@@ -129,11 +129,11 @@ class ListInput(Generic[K]):
     # FIXME: Without this pyright will not let any class inheric from this and define
     # a field that doesn't contain a default value...
     if TYPE_CHECKING:
-        set: Optional[List[K]]  # noqa: A003
+        set: Optional[List[K]]
         add: Optional[List[K]]
         remove: Optional[List[K]]
     else:
-        set: Optional[List[K]] = UNSET  # noqa: A003
+        set: Optional[List[K]] = UNSET
         add: Optional[List[K]] = UNSET
         remove: Optional[List[K]] = UNSET
 
@@ -445,12 +445,23 @@ def resolve_model_field_type(
             int,
         )  # Exclude IntegerChoices
     ):
-        choices = cast(List[Tuple[Any, str]], model_field.choices)
         field_type = getattr(model_field, "_strawberry_enum", None)
         if field_type is None:
             meta = model_field.model._meta
-            field_type = strawberry.enum(
-                enum.Enum(
+
+            enum_choices = {}
+            for c in model_field.choices:
+                # replace chars not compatible with GraphQL naming convention
+                choice_name = re.sub(r"^[^_a-zA-Z]|[^_a-zA-Z0-9]", "_", c[0])
+                # use str() to trigger eventual django's gettext_lazy string
+                choice_value = EnumValueDefinition(value=c[0], description=str(c[1]))
+
+                while choice_name in enum_choices:
+                    choice_name = choice_name + "_"
+                enum_choices[choice_name] = choice_value
+
+            field_type = strawberry.enum(  # type: ignore
+                enum.Enum(  # type: ignore
                     "".join(
                         (
                             capitalize_first(to_camel_case(meta.app_label)),
@@ -459,10 +470,7 @@ def resolve_model_field_type(
                             "Enum",
                         ),
                     ),
-                    {
-                        c[0]: EnumValueDefinition(value=c[0], description=c[1])
-                        for c in choices
-                    },
+                    enum_choices,
                 ),
                 description=(
                     f"{meta.verbose_name} | {model_field.verbose_name}"

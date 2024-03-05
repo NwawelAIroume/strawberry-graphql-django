@@ -197,6 +197,14 @@ class IssueType(relay.Node):
         strawberry_django.connection()
     )
 
+    @strawberry_django.field(select_related="milestone", only="milestone__name")
+    def milestone_name(self) -> str:
+        return self.milestone.name
+
+    @strawberry_django.field(select_related="milestone")
+    def milestone_name_without_only_optimization(self) -> str:
+        return self.milestone.name
+
 
 @strawberry_django.type(Tag)
 class TagType(relay.Node):
@@ -379,6 +387,9 @@ class Query:
     issue_list_obj_perm_required: List[IssueType] = strawberry_django.field(
         extensions=[HasRetvalPerm(perms=["projects.view_issue"])],
     )
+    issue_list_obj_perm_required_paginated: List[IssueType] = strawberry_django.field(
+        extensions=[HasRetvalPerm(perms=["projects.view_issue"])], pagination=True
+    )
     issue_conn_obj_perm_required: ListConnectionWithTotalCount[IssueType] = (
         strawberry_django.connection(
             extensions=[HasRetvalPerm(perms=["projects.view_issue"])],
@@ -498,6 +509,7 @@ class Mutation:
                 Quiz,
                 {"title": title},
                 full_clean={"exclude": ["sequence"]} if full_clean_options else True,
+                key_attr="id",
             ),
         )
 

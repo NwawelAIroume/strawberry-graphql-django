@@ -256,6 +256,8 @@ type IssueType implements Node {
     """Returns the items in the list that come after the specified cursor."""
     last: Int = null
   ): FavoriteTypeConnection!
+  milestoneName: String!
+  milestoneNameWithoutOnlyOptimization: String!
 }
 
 """A connection to a list of items."""
@@ -669,6 +671,7 @@ type Query {
     id: GlobalID!
   ): IssueType @hasRetvalPerm(permissions: [{app: "projects", permission: "view_issue"}], any: true)
   issueListObjPermRequired: [IssueType!]! @hasRetvalPerm(permissions: [{app: "projects", permission: "view_issue"}], any: true)
+  issueListObjPermRequiredPaginated(pagination: OffsetPaginationInput): [IssueType!]! @hasRetvalPerm(permissions: [{app: "projects", permission: "view_issue"}], any: true)
   issueConnObjPermRequired(
     """Returns the items in the list that come before the specified cursor."""
     before: String = null

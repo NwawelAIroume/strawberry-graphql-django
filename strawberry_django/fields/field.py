@@ -18,6 +18,7 @@ from typing import (
 from asgiref.sync import sync_to_async
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import models
+from django.db.models.fields.files import FileDescriptor
 from django.db.models.fields.related import (
     ForwardManyToOneDescriptor,
     ReverseManyToOneDescriptor,
@@ -113,6 +114,9 @@ class StrawberryDjangoField(
             prefetch_related=prefetch_related,
             annotate=annotate,
         )
+        # FIXME: Probably remove this when depending on graphql-core 3.3.0+
+        self.disable_fetch_list_results: bool = False
+
         super().__init__(*args, **kwargs)
 
     def __copy__(self) -> Self:
@@ -202,7 +206,14 @@ class StrawberryDjangoField(
                     # Reversed OneToOne will raise ObjectDoesNotExist when
                     # trying to access it if the relation doesn't exist.
                     except_as_none=(ObjectDoesNotExist,) if self.is_optional else None,
+                    empty_file_descriptor_as_null=True,
                 )
+            else:
+                # FileField/ImageField will always return a FileDescriptor, even when the
+                # field is "null". If it is falsy (i.e. doesn't have a file) we should
+                # return `None` instead.
+                if isinstance(attr, FileDescriptor) and not result:
+                    result = None
 
         if is_awaitable:
 
@@ -248,7 +259,9 @@ class StrawberryDjangoField(
 
             def qs_hook(qs: models.QuerySet):  # type: ignore
                 qs = self.get_queryset(qs, info, **kwargs)
-                return default_qs_hook(qs)
+                if not self.disable_fetch_list_results:
+                    qs = default_qs_hook(qs)
+                return qs
 
         elif self.is_optional:
 
@@ -271,9 +284,8 @@ class StrawberryDjangoField(
         if get_queryset:
             queryset = get_queryset(queryset, info, **kwargs)
 
-        queryset = filter_with_perms(
-            super().get_queryset(queryset, info, **kwargs),
-            info,
+        queryset = super().get_queryset(
+            filter_with_perms(queryset, info), info, **kwargs
         )
 
         # If optimizer extension is enabled, optimize this queryset

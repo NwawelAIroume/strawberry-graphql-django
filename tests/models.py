@@ -41,6 +41,12 @@ class Fruit(models.Model):
         default=5,
         help_text="Level of sweetness, from 1 to 10",
     )
+    picture = models.ImageField(
+        null=True,
+        blank=True,
+        default=None,
+        upload_to=".tmp_upload",
+    )
 
     def name_upper(self):
         return self.name.upper()
@@ -52,6 +58,15 @@ class Fruit(models.Model):
     @model_property
     def name_length(self) -> int:
         return len(self.name)
+
+
+class TomatoWithRequiredPicture(models.Model):
+    name = models.CharField(max_length=20)
+    picture = models.ImageField(
+        null=False,
+        blank=False,
+        upload_to=".tmp_upload",
+    )
 
 
 class Color(models.Model):

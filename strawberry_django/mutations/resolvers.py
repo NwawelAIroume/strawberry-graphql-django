@@ -254,9 +254,7 @@ def prepare_create_update(
 
             # If foreign object is not found, then create it
             elif value is None:
-                value = field.related_model._default_manager.create(  # noqa: PLW2901
-                    **value_data,
-                )
+                value = create(info,field.related_model,value_data,full_clean=full_clean) # noqa: PLW2901
 
             # If foreign object does not need updating, then skip it
             elif isinstance(value_data, dict) and not value_data:

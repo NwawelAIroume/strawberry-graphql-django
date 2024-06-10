@@ -382,6 +382,7 @@ def resolve_model_node(
         qs = get_queryset(qs, info)
 
     qs = qs.filter(**{id_attr: node_id})
+    print("Explain queryset ---0-->", qs.explain())
 
     if info is not None:
         if filter_perms:
@@ -391,6 +392,7 @@ def resolve_model_node(
         if ext is not None:
             # If optimizer extension is enabled, optimize this queryset
             qs = ext.optimize(qs, info=info)
+            print("Explain queryset optimizer", qs.explain())
 
     return django_resolver(lambda: qs.get() if required else qs.first())()
 

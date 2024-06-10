@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     from strawberry.file_uploads.scalars import Upload
     from strawberry.types.info import Info
     from typing_extensions import Literal
+    from django.contrib.contenttypes.fields import GenericRelation
 
 
 _T = TypeVar("_T")
@@ -198,7 +199,7 @@ def prepare_create_update(
             Upload | Literal[False],
         ]
     ],
-    list[tuple[ManyToManyField | ForeignObjectRel, Any]],
+    list[tuple[ManyToManyField | ForeignObjectRel | GenericRelation, Any]],
 ]:
     """Prepare data for updates and creates.
 
@@ -206,6 +207,8 @@ def prepare_create_update(
     update resolver methods.  It's to prepare the data
     for updating or creating.
     """
+    from django.contrib.contenttypes.fields import GenericRelation
+
     model = instance.__class__
     fields = get_model_fields(model)
     files: list[
@@ -214,7 +217,7 @@ def prepare_create_update(
             Upload | Literal[False],
         ]
     ] = []
-    m2m: list[tuple[ManyToManyField | ForeignObjectRel, Any]] = []
+    m2m: list[tuple[ManyToManyField | ForeignObjectRel | GenericRelation, Any]] = []
     direct_field_values: dict[str, object] = {}
 
     if dataclasses.is_dataclass(data):
@@ -237,7 +240,7 @@ def prepare_create_update(
             # set FileFields at the same time so their hooks can use other set values
             files.append((field, value))
             direct_field_value = False
-        elif isinstance(field, (ManyToManyField, ForeignObjectRel)):
+        elif isinstance(field, (ManyToManyField, ForeignObjectRel, GenericRelation)):
             # m2m will be processed later
             m2m.append((field, value))
             direct_field_value = False
@@ -286,7 +289,8 @@ def create(
     key_attr: str | None = "pk",
     full_clean: bool | FullCleanOptions = True,
     pre_save_hook: Callable[[_M], None] | None = None,
-) -> _M: ...
+) -> _M:
+    ...
 
 
 @overload
@@ -298,7 +302,8 @@ def create(
     key_attr: str | None = "pk",
     full_clean: bool | FullCleanOptions = True,
     pre_save_hook: Callable[[_M], None] | None = None,
-) -> list[_M]: ...
+) -> list[_M]:
+    ...
 
 
 @transaction.atomic
@@ -382,7 +387,8 @@ def update(
     key_attr: str | None = "pk",
     full_clean: bool | FullCleanOptions = True,
     pre_save_hook: Callable[[_M], None] | None = None,
-) -> _M: ...
+) -> _M:
+    ...
 
 
 @overload
@@ -394,7 +400,8 @@ def update(
     key_attr: str | None = "pk",
     full_clean: bool | FullCleanOptions = True,
     pre_save_hook: Callable[[_M], None] | None = None,
-) -> list[_M]: ...
+) -> list[_M]:
+    ...
 
 
 @transaction.atomic
@@ -460,7 +467,8 @@ def delete(
     instance: _M,
     *,
     data: dict[str, Any] | None = None,
-) -> _M: ...
+) -> _M:
+    ...
 
 
 @overload
@@ -469,7 +477,8 @@ def delete(
     instance: Iterable[_M],
     *,
     data: dict[str, Any] | None = None,
-) -> list[_M]: ...
+) -> list[_M]:
+    ...
 
 
 @transaction.atomic
@@ -523,11 +532,13 @@ def update_m2m(
     key_attr: str | None = "pk",
     full_clean: bool | FullCleanOptions = True,
 ):
+    from django.contrib.contenttypes.fields import GenericRelation
+
     if value is UNSET:
         return
 
     # FIXME / NOTE:  Should this be here?
-    # The field can only be ManyToManyField | ForeignObjectRel according to the definition
+    # The field can only be ManyToManyField | ForeignObjectRel | GenericRelation according to the definition
     # so why are there checks for OneTOneRel?
     if isinstance(field, OneToOneRel):
         remote_field = field.remote_field
@@ -545,7 +556,7 @@ def update_m2m(
     # END FIXME
 
     use_remove = True
-    if isinstance(field, ManyToManyField):
+    if isinstance(field, (ManyToManyField, GenericRelation)):
         manager = cast("RelatedManager", getattr(instance, field.attname))
     else:
         assert isinstance(field, (ManyToManyRel, ManyToOneRel))

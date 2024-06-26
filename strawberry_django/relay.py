@@ -1,4 +1,5 @@
 import inspect
+import warnings
 from typing import (
     Any,
     Iterable,
@@ -12,18 +13,18 @@ from typing import (
     overload,
 )
 
-import django
 import strawberry
 from asgiref.sync import sync_to_async
 from django.db import models
 from strawberry import relay
 from strawberry.relay.exceptions import NodeIDAnnotationError
 from strawberry.relay.types import NodeIterableType
+from strawberry.type import StrawberryContainer, get_object_definition
 from strawberry.types.info import Info
 from strawberry.utils.await_maybe import AwaitableOrValue
-from strawberry.utils.inspect import in_async_context
 from typing_extensions import Literal, Self
 
+from strawberry_django.queryset import run_type_get_queryset
 from strawberry_django.resolvers import django_getattr, django_resolver
 from strawberry_django.utils.typing import (
     WithStrawberryDjangoObjectDefinition,
@@ -49,7 +50,30 @@ class ListConnectionWithTotalCount(relay.ListConnection[relay.NodeType]):
     @strawberry.field(description="Total quantity of existing nodes.")
     @django_resolver
     def total_count(self) -> Optional[int]:
+        from .optimizer import is_optimized_by_prefetching
+
         assert self.nodes is not None
+
+        if isinstance(self.nodes, models.QuerySet) and is_optimized_by_prefetching(
+            self.nodes
+        ):
+            result = cast(List[relay.NodeType], self.nodes._result_cache)  # type: ignore
+            try:
+                return (
+                    result[0]._strawberry_total_count  # type: ignore
+                    if result
+                    else 0
+                )
+            except AttributeError:
+                warnings.warn(
+                    (
+                        "Pagination annotations not found, falling back to QuerySet resolution. "
+                        "This might cause n+1 issues..."
+                    ),
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+
         total_count = None
         try:
             total_count = cast(
@@ -74,18 +98,32 @@ class ListConnectionWithTotalCount(relay.ListConnection[relay.NodeType]):
         last: Optional[int] = None,
         **kwargs: Any,
     ) -> AwaitableOrValue[Self]:
-        # FIXME: Asynchronous queryset iteration is only available on Django 4.1+.
-        # Remove this when Django we can remove support for django 4.0 and older
-        if django.VERSION < (4, 1) and in_async_context():
-            return sync_to_async(cls.resolve_connection)(  # type: ignore
-                nodes,
-                info=info,
-                before=before,
-                after=after,
-                first=first,
-                last=last,
-                **kwargs,
-            )
+        from strawberry_django.optimizer import is_optimized_by_prefetching
+
+        if isinstance(nodes, models.QuerySet) and is_optimized_by_prefetching(nodes):
+            try:
+                conn = cls.resolve_connection_from_cache(
+                    nodes,
+                    info=info,
+                    before=before,
+                    after=after,
+                    first=first,
+                    last=last,
+                    **kwargs,
+                )
+            except AttributeError:
+                warnings.warn(
+                    (
+                        "Pagination annotations not found, falling back to QuerySet resolution. "
+                        "This might cause N+1 issues..."
+                    ),
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            else:
+                conn = cast(Self, conn)
+                conn.nodes = nodes
+                return conn
 
         conn = super().resolve_connection(
             nodes,
@@ -109,6 +147,61 @@ class ListConnectionWithTotalCount(relay.ListConnection[relay.NodeType]):
         conn = cast(Self, conn)
         conn.nodes = nodes
         return conn
+
+    @classmethod
+    def resolve_connection_from_cache(
+        cls,
+        nodes: NodeIterableType[relay.NodeType],
+        *,
+        info: Info,
+        before: Optional[str] = None,
+        after: Optional[str] = None,
+        first: Optional[int] = None,
+        last: Optional[int] = None,
+        **kwargs: Any,
+    ) -> AwaitableOrValue[Self]:
+        """Resolve the connection from the prefetched cache.
+
+        NOTE: This will try to access `node._strawberry_total_count` and
+        `node._strawberry_row_number` attributes from the nodes. If they
+        don't exist, `AttriuteError` will be raised, meaning that we should
+        fallback to the queryset resolution.
+        """
+        result = nodes._result_cache  # type: ignore
+
+        type_def = get_object_definition(cls, strict=True)
+        field_def = type_def.get_field("edges")
+        assert field_def
+
+        field = field_def.resolve_type(type_definition=type_def)
+        while isinstance(field, StrawberryContainer):
+            field = field.of_type
+
+        edge_class = cast(relay.Edge[relay.NodeType], field)
+
+        edges: List[relay.Edge] = [
+            edge_class.resolve_edge(
+                cls.resolve_node(node, info=info, **kwargs),
+                cursor=node._strawberry_row_number - 1,
+            )
+            for node in result
+        ]
+        has_previous_page = (
+            nodes[0]._strawberry_row_number > 1  # type: ignore
+            if result
+            else False
+        )
+        has_next_page = result._strawberry_row_number < result if result else False
+
+        return cls(
+            edges=edges,
+            page_info=relay.PageInfo(
+                start_cursor=edges[0].cursor if edges else None,
+                end_cursor=edges[-1].cursor if edges else None,
+                has_previous_page=has_previous_page,
+                has_next_page=has_next_page,
+            ),
+        )
 
 
 @overload
@@ -242,10 +335,7 @@ def resolve_model_nodes(
         source = cast(Type[_M], django_type.model)
 
     qs = cast(models.QuerySet[_M], source._default_manager.all())
-
-    get_queryset = getattr(origin, "get_queryset", None)
-    if get_queryset:
-        qs = get_queryset(qs, info)
+    qs = run_type_get_queryset(qs, origin, info)
 
     id_attr = cast(relay.Node, origin).resolve_id_attr()
     if node_ids is not None:
@@ -298,7 +388,7 @@ def resolve_model_nodes(
 
         return async_resolver()
 
-    return map_results(cast(models.QuerySet[_M], retval))
+    return map_results(retval)
 
 
 @overload
@@ -376,10 +466,7 @@ def resolve_model_node(
 
     id_attr = cast(relay.Node, origin).resolve_id_attr()
     qs = source._default_manager.all()
-
-    get_queryset = getattr(origin, "get_queryset", None)
-    if get_queryset:
-        qs = get_queryset(qs, info)
+    qs = run_type_get_queryset(qs, origin, info)
 
     qs = qs.filter(**{id_attr: node_id})
     print("Explain queryset ---0-->", qs.explain())

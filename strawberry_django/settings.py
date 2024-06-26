@@ -36,6 +36,12 @@ class StrawberryDjangoSettings(TypedDict):
     #: `relay.GlobalID` instead of `strawberry.ID` for types and filters.
     MAP_AUTO_ID_AS_GLOBAL_ID: bool
 
+    #: Set a primary key default field name for Django CRUD resolvers.
+    DEFAULT_PK_FIELD_NAME: str
+
+    #: If True, deprecated way of using filters will be working
+    USE_DEPRECATED_FILTERS: bool
+
 
 DEFAULT_DJANGO_SETTINGS = StrawberryDjangoSettings(
     FIELD_DESCRIPTION_FROM_HELP_TEXT=False,
@@ -44,6 +50,8 @@ DEFAULT_DJANGO_SETTINGS = StrawberryDjangoSettings(
     MUTATIONS_DEFAULT_ARGUMENT_NAME="data",
     MUTATIONS_DEFAULT_HANDLE_ERRORS=False,
     MAP_AUTO_ID_AS_GLOBAL_ID=False,
+    DEFAULT_PK_FIELD_NAME="pk",
+    USE_DEPRECATED_FILTERS=False,
 )
 
 

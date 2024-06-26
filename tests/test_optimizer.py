@@ -5,11 +5,13 @@ import pytest
 import strawberry
 from django.db.models import Prefetch
 from django.utils import timezone
+from pytest_mock import MockerFixture
 from strawberry.relay import to_base64
 from strawberry.types import ExecutionResult
 
 import strawberry_django
 from strawberry_django.optimizer import DjangoOptimizerExtension
+from tests.projects.schema import StaffType
 
 from . import utils
 from .projects.faker import (
@@ -56,7 +58,14 @@ def test_user_query(db, gql_client: GraphQLTestClient):
 
 
 @pytest.mark.django_db(transaction=True)
-def test_staff_query(db, gql_client: GraphQLTestClient):
+def test_staff_query(db, gql_client: GraphQLTestClient, mocker: MockerFixture):
+    staff_type_get_queryset = StaffType.get_queryset
+    mock_staff_type_get_queryset = mocker.patch(
+        "tests.projects.schema.StaffType.get_queryset",
+        autospec=True,
+        side_effect=staff_type_get_queryset,
+    )
+
     query = """
       query TestQuery {
         staffConn {
@@ -81,6 +90,7 @@ def test_staff_query(db, gql_client: GraphQLTestClient):
             ],
         },
     }
+    mock_staff_type_get_queryset.assert_called_once()
 
 
 @pytest.mark.django_db(transaction=True)
@@ -166,6 +176,68 @@ def test_query_forward(db, gql_client: GraphQLTestClient):
                 project {
                   id
                   name
+                }
+              }
+            }
+          }
+        }
+      }
+    """
+
+    expected = []
+    for p in ProjectFactory.create_batch(2):
+        for m in MilestoneFactory.create_batch(2, project=p):
+            for i in IssueFactory.create_batch(2, milestone=m):
+                r: dict[str, Any] = {
+                    "id": to_base64("IssueType", i.id),
+                    "name": i.name,
+                    "milestone": {
+                        "id": to_base64("MilestoneType", m.id),
+                        "name": m.name,
+                        "project": {
+                            "id": to_base64("ProjectType", p.id),
+                            "name": p.name,
+                        },
+                    },
+                }
+                if gql_client.is_async:
+                    r["milestone"]["asyncField"] = "value: foo"
+                expected.append(r)
+
+    with assert_num_queries(2 if DjangoOptimizerExtension.enabled.get() else 18):
+        res = gql_client.query(query, {"isAsync": gql_client.is_async})
+
+    assert res.data == {
+        "issueConn": {
+            "totalCount": 8,
+            "edges": [{"node": r} for r in expected],
+        },
+    }
+
+
+@pytest.mark.django_db(transaction=True)
+def test_query_forward_with_interfaces(db, gql_client: GraphQLTestClient):
+    query = """
+      query TestQuery ($isAsync: Boolean!) {
+        issueConn {
+          totalCount
+          edges {
+            node {
+              id
+              ... on Named {
+                name
+              }
+              milestone {
+                id
+                ... on Named {
+                  name
+                }
+                asyncField(value: "foo") @include (if: $isAsync)
+                project {
+                  id
+                  ... on Named {
+                    name
+                  }
                 }
               }
             }
@@ -609,7 +681,7 @@ def test_query_connection_nested(db, gql_client: GraphQLTestClient):
     for issue in t2_issues:
         t2.issues.add(issue)
 
-    with assert_num_queries(5):
+    with assert_num_queries(2 if DjangoOptimizerExtension.enabled.get() else 5):
         res = gql_client.query(query)
 
     assert res.data == {
@@ -940,5 +1012,316 @@ def test_query_select_related_without_only(db, gql_client: GraphQLTestClient):
         "issue": {
             "id": to_base64("IssueType", issue.id),
             "milestoneNameWithoutOnlyOptimization": milestone.name,
+        },
+    }
+
+
+@pytest.mark.django_db(transaction=True)
+def test_handles_existing_select_related(db, gql_client: GraphQLTestClient):
+    """select_related should not cause errors, even if the field does not get queried."""
+    # We're *not* querying the issues' milestones, even though it's
+    # prefetched.
+    query = """
+      query TestQuery {
+        tagList {
+          issuesWithSelectedRelatedMilestoneAndProject {
+            id
+            name
+          }
+        }
+      }
+    """
+
+    tag = TagFactory.create()
+
+    issues = IssueFactory.create_batch(3)
+    for issue in issues:
+        tag.issues.add(issue)
+
+    with assert_num_queries(2):
+        res = gql_client.query(query)
+
+    assert res.data == {
+        "tagList": [
+            {
+                "issuesWithSelectedRelatedMilestoneAndProject": [
+                    {"id": to_base64("IssueType", t.id), "name": t.name}
+                    for t in sorted(issues, key=lambda i: i.pk)
+                ],
+            },
+        ],
+    }
+
+
+@pytest.mark.django_db(transaction=True)
+def test_query_nested_connection_with_filter(db, gql_client: GraphQLTestClient):
+    query = """
+      query TestQuery ($id: GlobalID!) {
+        milestone(id: $id) {
+          id
+          issuesWithFilters (filters: {search: "Foo"}) {
+            edges {
+              node {
+                id
+              }
+            }
+          }
+        }
+      }
+    """
+
+    milestone = MilestoneFactory.create()
+    issue1 = IssueFactory.create(milestone=milestone, name="Foo")
+    issue2 = IssueFactory.create(milestone=milestone, name="Foo Bar")
+    issue3 = IssueFactory.create(milestone=milestone, name="Bar Foo")
+    IssueFactory.create(milestone=milestone, name="Bar Bin")
+
+    with assert_num_queries(2):
+        res = gql_client.query(query, {"id": to_base64("MilestoneType", milestone.pk)})
+
+    assert isinstance(res.data, dict)
+    result = res.data["milestone"]
+    assert isinstance(result, dict)
+
+    expected = {to_base64("IssueType", i.pk) for i in [issue1, issue2, issue3]}
+    assert {
+        edge["node"]["id"] for edge in result["issuesWithFilters"]["edges"]
+    } == expected
+
+
+@pytest.mark.django_db(transaction=True)
+def test_query_with_optimizer_paginated_prefetch():
+    @strawberry_django.type(Milestone, pagination=True)
+    class MilestoneTypeWithNestedPrefetch:
+        @strawberry_django.field()
+        def name(self, info) -> str:
+            return self.name
+
+    @strawberry_django.type(
+        Project,
+    )
+    class ProjectTypeWithPrefetch:
+        @strawberry_django.field()
+        def name(self, info) -> str:
+            return self.name
+
+        milestones: List[MilestoneTypeWithNestedPrefetch]
+
+    milestone1 = MilestoneFactory.create()
+    project = milestone1.project
+    MilestoneFactory.create(project=project)
+
+    @strawberry.type
+    class Query:
+        projects: List[ProjectTypeWithPrefetch] = strawberry_django.field()
+
+    query1 = utils.generate_query(Query, enable_optimizer=False)
+    query_str = """
+      fragment f on ProjectTypeWithPrefetch {
+         milestones (pagination: {limit: 1}) {
+           name
+         }
+      }
+
+      query TestQuery {
+        projects {
+            name
+            ...f
+        }
+      }
+    """
+
+    # NOTE: The following assertion doesn't work because the
+    # DjangoOptimizerExtension instance is not the one within the
+    # generate_query wrapper
+    """
+    assert DjangoOptimizerExtension.enabled.get()
+    """
+    result1 = query1(query_str)
+
+    assert isinstance(result1, ExecutionResult)
+    assert not result1.errors
+    assert result1.data == {
+        "projects": [
+            {
+                "name": project.name,
+                "milestones": [
+                    {
+                        "name": milestone1.name,
+                    },
+                ],
+            },
+        ],
+    }
+
+    query2 = utils.generate_query(Query, enable_optimizer=True)
+    result2 = query2(query_str)
+
+    assert isinstance(result2, ExecutionResult)
+    assert result2.data == {
+        "projects": [
+            {
+                "name": project.name,
+                "milestones": [
+                    {
+                        "name": milestone1.name,
+                    },
+                ],
+            },
+        ],
+    }
+
+
+@pytest.mark.django_db(transaction=True)
+def test_nested_prefetch_with_filter(db, gql_client: GraphQLTestClient):
+    query = """
+      query TestQuery ($id: GlobalID!) {
+        milestone(id: $id) {
+          id
+          name
+          issues (filters: {search: "Foo"}) {
+            id
+            name
+          }
+        }
+      }
+    """
+
+    milestone = MilestoneFactory.create()
+    issue1 = IssueFactory.create(milestone=milestone, name="Foo")
+    issue2 = IssueFactory.create(milestone=milestone, name="Foo Bar")
+    IssueFactory.create(milestone=milestone, name="Bar")
+    issue4 = IssueFactory.create(milestone=milestone, name="Bar Foo")
+    IssueFactory.create(milestone=milestone, name="Bar Bin")
+
+    with assert_num_queries(2):
+        res = gql_client.query(
+            query,
+            {"id": to_base64("MilestoneType", milestone.pk)},
+        )
+
+    assert isinstance(res.data, dict)
+    assert res.data == {
+        "milestone": {
+            "id": to_base64("MilestoneType", milestone.pk),
+            "name": milestone.name,
+            "issues": [
+                {
+                    "id": to_base64("IssueType", issue.pk),
+                    "name": issue.name,
+                }
+                for issue in [issue1, issue2, issue4]
+            ],
+        },
+    }
+
+
+@pytest.mark.django_db(transaction=True)
+def test_nested_prefetch_with_filter_and_pagination(db, gql_client: GraphQLTestClient):
+    query = """
+      query TestQuery ($id: GlobalID!) {
+        milestone(id: $id) {
+          id
+          name
+          issues (filters: {search: "Foo"}, pagination: {limit: 2}) {
+            id
+            name
+          }
+        }
+      }
+    """
+
+    milestone = MilestoneFactory.create()
+    issue1 = IssueFactory.create(milestone=milestone, name="Foo")
+    issue2 = IssueFactory.create(milestone=milestone, name="Foo Bar")
+    IssueFactory.create(milestone=milestone, name="Bar")
+    IssueFactory.create(milestone=milestone, name="Bar Foo")
+    IssueFactory.create(milestone=milestone, name="Bar Bin")
+
+    with assert_num_queries(2):
+        res = gql_client.query(
+            query,
+            {"id": to_base64("MilestoneType", milestone.pk)},
+        )
+
+    assert isinstance(res.data, dict)
+    assert res.data == {
+        "milestone": {
+            "id": to_base64("MilestoneType", milestone.pk),
+            "name": milestone.name,
+            "issues": [
+                {
+                    "id": to_base64("IssueType", issue.pk),
+                    "name": issue.name,
+                }
+                for issue in [issue1, issue2]
+            ],
+        },
+    }
+
+
+@pytest.mark.django_db(transaction=True)
+def test_nested_prefetch_with_multiple_levels(db, gql_client: GraphQLTestClient):
+    query = """
+      query TestQuery ($id: GlobalID!) {
+        milestone(id: $id) {
+          id
+          name
+          issues (order: { name: ASC }) {
+            id
+            name
+            tags {
+              id
+              name
+            }
+          }
+        }
+      }
+    """
+
+    milestone = MilestoneFactory.create()
+
+    issue1 = IssueFactory.create(milestone=milestone, name="2Foo")
+    issue2 = IssueFactory.create(milestone=milestone, name="1Foo")
+    issue3 = IssueFactory.create(milestone=milestone, name="4Foo")
+    issue4 = IssueFactory.create(milestone=milestone, name="3Foo")
+    issue5 = IssueFactory.create(milestone=milestone, name="5Foo")
+
+    tag1 = TagFactory.create()
+    issue1.tags.add(tag1)
+    issue2.tags.add(tag1)
+    tag2 = TagFactory.create()
+    issue2.tags.add(tag2)
+    issue3.tags.add(tag2)
+
+    with assert_num_queries(3 if DjangoOptimizerExtension.enabled.get() else 7):
+        res = gql_client.query(
+            query,
+            {"id": to_base64("MilestoneType", milestone.pk)},
+        )
+
+    expected_issues = [
+        {
+            "id": to_base64("IssueType", issue.pk),
+            "name": issue.name,
+            "tags": [
+                {"id": to_base64("TagType", tag.pk), "name": tag.name} for tag in tags
+            ],
+        }
+        for issue, tags in [
+            (issue2, [tag1, tag2]),
+            (issue1, [tag1]),
+            (issue4, []),
+            (issue3, [tag2]),
+            (issue5, []),
+        ]
+    ]
+
+    assert isinstance(res.data, dict)
+    assert res.data == {
+        "milestone": {
+            "id": to_base64("MilestoneType", milestone.pk),
+            "name": milestone.name,
+            "issues": expected_issues,
         },
     }

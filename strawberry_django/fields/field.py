@@ -29,21 +29,24 @@ from django.db.models.query_utils import DeferredAttribute
 from strawberry import UNSET, relay
 from strawberry.annotation import StrawberryAnnotation
 from strawberry.types.fields.resolver import StrawberryResolver
+from strawberry.types.info import Info  # noqa: TCH002
 
 from strawberry_django import optimizer
 from strawberry_django.arguments import argument
 from strawberry_django.descriptors import ModelProperty
 from strawberry_django.fields.base import StrawberryDjangoFieldBase
 from strawberry_django.filters import FILTERS_ARG, StrawberryDjangoFieldFilters
-from strawberry_django.optimizer import OptimizerStore
+from strawberry_django.optimizer import OptimizerStore, is_optimized_by_prefetching
 from strawberry_django.ordering import ORDER_ARG, StrawberryDjangoFieldOrdering
 from strawberry_django.pagination import StrawberryDjangoPagination
 from strawberry_django.permissions import filter_with_perms
+from strawberry_django.queryset import run_type_get_queryset
 from strawberry_django.relay import resolve_model_nodes
 from strawberry_django.resolvers import (
     default_qs_hook,
     django_getattr,
     django_resolver,
+    resolve_base_manager,
 )
 
 if TYPE_CHECKING:
@@ -56,7 +59,6 @@ if TYPE_CHECKING:
     )
     from strawberry.field import _RESOLVER_TYPE, StrawberryField
     from strawberry.relay.types import NodeIterableType
-    from strawberry.types.info import Info
     from strawberry.unset import UnsetType
     from typing_extensions import Literal, Self
 
@@ -221,7 +223,7 @@ class StrawberryDjangoField(
                 resolved = await result  # type: ignore
 
                 if isinstance(resolved, BaseManager):
-                    resolved = resolved.all()
+                    resolved = resolve_base_manager(resolved)
 
                 if isinstance(resolved, models.QuerySet):
                     if "info" not in kwargs:
@@ -236,7 +238,7 @@ class StrawberryDjangoField(
             return async_resolver()
 
         if isinstance(result, BaseManager):
-            result = result.all()
+            result = resolve_base_manager(result)
 
         if isinstance(result, models.QuerySet):
             if "info" not in kwargs:
@@ -278,12 +280,12 @@ class StrawberryDjangoField(
         return qs_hook
 
     def get_queryset(self, queryset, info, **kwargs):
-        type_ = self.django_type
+        # If the queryset been optimized at prefetch phase, this function has already been
+        # called by the optimizer extension, meaning we don't want to call it again
+        if is_optimized_by_prefetching(queryset):
+            return queryset
 
-        get_queryset = getattr(type_, "get_queryset", None)
-        if get_queryset:
-            queryset = get_queryset(queryset, info, **kwargs)
-
+        queryset = run_type_get_queryset(queryset, self.django_type, info)
         queryset = super().get_queryset(
             filter_with_perms(queryset, info), info, **kwargs
         )
@@ -567,6 +569,7 @@ def field(
 
 def node(
     *,
+    field_cls: type[StrawberryDjangoField] = StrawberryDjangoField,
     name: str | None = None,
     field_name: str | None = None,
     is_subscription: bool = False,
@@ -612,7 +615,7 @@ def node(
 
     """
     extensions = [*extensions, relay.NodeExtension()]
-    return StrawberryDjangoField(
+    return field_cls(
         python_name=None,
         django_name=field_name,
         graphql_name=name,
@@ -633,6 +636,7 @@ def node(
 def connection(
     graphql_type: type[relay.Connection[relay.NodeType]] | None = None,
     *,
+    field_cls: type[StrawberryDjangoField] = StrawberryDjangoField,
     name: str | None = None,
     field_name: str | None = None,
     is_subscription: bool = False,
@@ -658,6 +662,7 @@ def connection(
 def connection(
     graphql_type: type[relay.Connection[relay.NodeType]] | None = None,
     *,
+    field_cls: type[StrawberryDjangoField] = StrawberryDjangoField,
     resolver: _RESOLVER_TYPE[NodeIterableType[Any]] | None = None,
     name: str | None = None,
     field_name: str | None = None,
@@ -684,6 +689,7 @@ def connection(
 def connection(
     graphql_type: type[relay.Connection[relay.NodeType]] | None = None,
     *,
+    field_cls: type[StrawberryDjangoField] = StrawberryDjangoField,
     resolver: _RESOLVER_TYPE[NodeIterableType[Any]] | None = None,
     name: str | None = None,
     field_name: str | None = None,
@@ -768,7 +774,7 @@ def connection(
 
     """
     extensions = [*extensions, StrawberryDjangoConnectionExtension()]
-    f = StrawberryDjangoField(
+    f = field_cls(
         python_name=None,
         django_name=field_name,
         graphql_name=name,

@@ -36,12 +36,6 @@ class FieldTypesModel(models.Model):
     generic_ip_address = models.GenericIPAddressField()
     integer = models.IntegerField()
     image = models.ImageField()
-    # NullBooleanField was deprecated and will soon be removed
-    null_boolean = (
-        models.NullBooleanField()  # type: ignore
-        if hasattr(models, "NullBooleanField")
-        else models.BooleanField(null=True)
-    )
     positive_big_integer = models.PositiveBigIntegerField()
     positive_integer = models.PositiveIntegerField()
     positive_small_integer = models.PositiveSmallIntegerField()
@@ -86,7 +80,6 @@ def test_field_types():
         generic_ip_address: auto
         integer: auto
         image: auto
-        null_boolean: auto
         positive_big_integer: auto
         positive_integer: auto
         positive_small_integer: auto
@@ -113,7 +106,6 @@ def test_field_types():
         ("generic_ip_address", str),
         ("integer", int),
         ("image", strawberry_django.DjangoImageType),
-        ("null_boolean", StrawberryOptional(bool)),
         ("positive_big_integer", int),
         ("positive_integer", int),
         ("positive_small_integer", int),
@@ -330,11 +322,11 @@ def test_inherit_type():
     @strawberry_django.type(FieldTypesModel)
     class Base:
         char: auto
-        one_to_one: "Type"  # type: ignore
+        one_to_one: "Type"
 
     @strawberry_django.type(FieldTypesModel)
     class Type(Base):  # type: ignore
-        many_to_many: List["Type"]  # type: ignore
+        many_to_many: List["Type"]
 
     object_definition = get_object_definition(Type, strict=True)
     assert [(f.name, f.type) for f in object_definition.fields] == [

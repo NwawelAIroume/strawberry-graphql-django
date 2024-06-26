@@ -28,20 +28,33 @@ from django.db.models.fields.reverse_related import (
 )
 from django.db.models.manager import BaseManager
 from django.db.models.query import QuerySet
+from graphql import (
+    FieldNode,
+    GraphQLInterfaceType,
+    GraphQLObjectType,
+    GraphQLOutputType,
+    GraphQLWrappingType,
+    get_argument_values,
+)
+from graphql.execution.collect_fields import collect_sub_fields
 from graphql.language.ast import OperationType
 from graphql.type.definition import GraphQLResolveInfo, get_named_type
 from strawberry import relay
 from strawberry.extensions import SchemaExtension
 from strawberry.lazy_type import LazyType
 from strawberry.object_type import StrawberryObjectDefinition
+from strawberry.relay.utils import SliceMetadata
 from strawberry.schema.schema import Schema
+from strawberry.schema.schema_converter import get_arguments
 from strawberry.type import get_object_definition
 from strawberry.types.info import Info
-from strawberry.types.nodes import InlineFragment, Selection, convert_selections
 from strawberry.utils.typing import eval_type
 from typing_extensions import assert_never, assert_type, get_args
 
 from strawberry_django.fields.types import resolve_model_field_name
+from strawberry_django.pagination import apply_window_pagination
+from strawberry_django.queryset import get_queryset_config, run_type_get_queryset
+from strawberry_django.relay import ListConnectionWithTotalCount
 from strawberry_django.resolvers import django_fetch
 
 from .descriptors import ModelProperty
@@ -49,7 +62,6 @@ from .utils.inspect import (
     PrefetchInspector,
     get_model_fields,
     get_possible_type_definitions,
-    get_selections,
 )
 from .utils.typing import (
     AnnotateCallable,
@@ -62,6 +74,7 @@ from .utils.typing import (
 )
 
 if TYPE_CHECKING:
+    from strawberry.field import StrawberryField
     from strawberry.types.execution import ExecutionContext
     from strawberry.utils.await_maybe import AwaitableOrValue
 
@@ -74,6 +87,7 @@ __all__ = [
     "optimize",
 ]
 
+NESTED_PREFETCH_MARK = "_strawberry_nested_prefetch_optimized"
 _M = TypeVar("_M", bound=models.Model)
 
 _sentinel = object()
@@ -100,6 +114,8 @@ class OptimizerConfig:
             Enable `QuerySet.prefetch_related` optimizations
         enable_annotate:
             Enable `QuerySet.annotate` optimizations
+        enable_nested_relations_prefetch:
+            Enable prefetch of nested relations optimizations.
         prefetch_custom_queryset:
             Use custom instead of _base_manager for prefetch querysets
 
@@ -109,6 +125,7 @@ class OptimizerConfig:
     enable_select_related: bool = dataclasses.field(default=True)
     enable_prefetch_related: bool = dataclasses.field(default=True)
     enable_annotate: bool = dataclasses.field(default=True)
+    enable_nested_relations_prefetch: bool = dataclasses.field(default=True)
     prefetch_custom_queryset: bool = dataclasses.field(default=False)
 
 
@@ -285,18 +302,41 @@ class OptimizerStore:
 
         only_set = set(self.only)
         select_related_only_set = set()
+        select_related_set = set(self.select_related)
 
-        if config.enable_select_related and self.select_related:
-            qs = qs.select_related(*self.select_related)
+        # inspect the queryset to find any existing select_related fields
+        def get_related_fields_with_prefix(
+            queryset_select_related: dict[str, Any], prefix=""
+        ):
+            fields = []
+            for parent, nested in queryset_select_related.items():
+                current_path = f"{prefix}{parent}"
+                fields.append(current_path)
+                if nested:  # If there are nested relations, dive deeper
+                    fields.extend(
+                        get_related_fields_with_prefix(
+                            nested,
+                            prefix=f"{current_path}{LOOKUP_SEP}",
+                        )
+                    )
+            return fields
 
-            for select_related in self.select_related:
+        if isinstance(qs.query.select_related, dict):
+            select_related_set.update(
+                get_related_fields_with_prefix(qs.query.select_related)
+            )
+
+        if config.enable_select_related and select_related_set:
+            qs = qs.select_related(*select_related_set)
+
+            for select_related in select_related_set:
                 if select_related in only_set:
                     continue
 
                 if not any(only.startswith(select_related) for only in only_set):
                     select_related_only_set.add(select_related)
 
-        if config.enable_only and only_set:
+        if config.enable_only and (only_set or select_related_only_set):
             qs = qs.only(*(only_set | select_related_only_set))
 
         if config.enable_annotate and self.annotate:
@@ -313,38 +353,193 @@ class OptimizerStore:
 
 def _get_prefetch_queryset(
     remote_model: type[models.Model],
-    field,
+    schema: Schema,
+    field: StrawberryField,
+    parent_type: GraphQLObjectType | GraphQLInterfaceType,
+    field_node: FieldNode,
+    *,
     config: OptimizerConfig | None,
     info: GraphQLResolveInfo,
+    related_field_id: str | None = None,
 ) -> QuerySet:
     qs = remote_model._base_manager.all()  # type: ignore
-    if not config or not config.prefetch_custom_queryset:
+
+    if config and config.prefetch_custom_queryset and field.type_annotation is not None:
+        remote_type_defs = get_args(field.type_annotation.annotation)
+        if len(remote_type_defs) != 1:
+            raise TypeError(f"Expected exactly one remote type: {remote_type_defs}")
+
+        if type(remote_type_defs[0]) is ForwardRef:
+            remote_type = eval_type(
+                remote_type_defs[0],
+                field.type_annotation.namespace,
+                None,
+            )
+        else:
+            remote_type = remote_type_defs[0]
+
+        qs = run_type_get_queryset(
+            qs,
+            remote_type,
+            info=Info(
+                _raw_info=info,
+                _field=field,
+            ),
+        )
+
+    return _optimize_prefetch_queryset(
+        qs,
+        schema,
+        field,
+        parent_type,
+        field_node,
+        config=config,
+        info=info,
+        related_field_id=related_field_id,
+    )
+
+
+def _optimize_prefetch_queryset(
+    qs: QuerySet[_M],
+    schema: Schema,
+    field: StrawberryField,
+    parent_type: GraphQLObjectType | GraphQLInterfaceType,
+    field_node: FieldNode,
+    *,
+    config: OptimizerConfig | None,
+    info: GraphQLResolveInfo,
+    related_field_id: str | None = None,
+) -> QuerySet[_M]:
+    from strawberry_django.fields.field import (
+        StrawberryDjangoConnectionExtension,
+        StrawberryDjangoField,
+    )
+
+    if (
+        not config
+        or not config.enable_nested_relations_prefetch
+        or related_field_id is None
+        or not isinstance(field, StrawberryDjangoField)
+        or is_optimized_by_prefetching(qs)
+    ):
         return qs
 
-    remote_type_defs = get_args(field.type_annotation.annotation)
-    if len(remote_type_defs) != 1:
-        raise TypeError(f"Expected exactly one remote type: {remote_type_defs}")
-    if type(remote_type_defs[0]) is ForwardRef:
-        remote_type = eval_type(
-            remote_type_defs[0],
-            field.type_annotation.namespace,
+    mark_optimized = True
+
+    strawberry_schema = cast(Schema, info.schema._strawberry_schema)  # type: ignore
+    field_name = strawberry_schema.config.name_converter.from_field(field)
+    field_info = Info(
+        _raw_info=info,
+        _field=field,
+    )
+    _field_args, field_kwargs = get_arguments(
+        field=field,
+        source=None,
+        info=field_info,
+        kwargs=get_argument_values(
+            parent_type.fields[field_name],
+            field_node,
+            info.variable_values,
+        ),
+        config=strawberry_schema.config,
+        scalar_registry=strawberry_schema.schema_converter.scalar_registry,
+    )
+    field_kwargs.pop("info", None)
+
+    # Disable the optimizer to avoid doint double optimization while running get_queryset
+    with DjangoOptimizerExtension.disabled():
+        qs = field.get_queryset(
+            qs,
+            field_info,
+            _strawberry_related_field_id=related_field_id,
+            **field_kwargs,
+        )
+
+        connection_extension = next(
+            (
+                e
+                for e in field.extensions
+                if isinstance(e, StrawberryDjangoConnectionExtension)
+            ),
             None,
         )
-    else:
-        remote_type = remote_type_defs[0]
+        if connection_extension is not None:
+            connection_type_def = get_object_definition(
+                connection_extension.connection_type,
+                strict=True,
+            )
+            connection_type = (
+                connection_type_def.concrete_of
+                and connection_type_def.concrete_of.origin
+            )
+            if (
+                connection_type is relay.ListConnection
+                or connection_type is ListConnectionWithTotalCount
+            ):
+                slice_metadata = SliceMetadata.from_arguments(
+                    Info(_raw_info=info, _field=field),
+                    first=field_kwargs.get("first"),
+                    last=field_kwargs.get("last"),
+                    before=field_kwargs.get("before"),
+                    after=field_kwargs.get("after"),
+                )
+                qs = apply_window_pagination(
+                    qs,
+                    related_field_id=related_field_id,
+                    offset=slice_metadata.start,
+                    limit=slice_metadata.end - slice_metadata.start,
+                )
+            else:
+                mark_optimized = False
 
-    if get_queryset := getattr(remote_type, "get_queryset", None):
-        return get_queryset(qs, info)
+    if mark_optimized:
+        qs = mark_optimized_by_prefetching(qs)
 
     return qs
+
+
+def _get_selections(
+    info: GraphQLResolveInfo,
+    parent_type: GraphQLObjectType | GraphQLInterfaceType,
+) -> dict[str, list[FieldNode]]:
+    return collect_sub_fields(
+        info.schema,
+        info.fragments,
+        info.variable_values,
+        cast(GraphQLObjectType, parent_type),
+        info.field_nodes,
+    )
+
+
+def _generate_selection_resolve_info(
+    info: GraphQLResolveInfo,
+    field_nodes: list[FieldNode],
+    return_type: GraphQLOutputType,
+    parent_type: GraphQLObjectType | GraphQLInterfaceType,
+):
+    field_node = field_nodes[0]
+    return GraphQLResolveInfo(
+        field_name=field_node.name.value,
+        field_nodes=field_nodes,
+        return_type=return_type,
+        parent_type=cast(GraphQLObjectType, parent_type),
+        path=info.path.add_key(0).add_key(field_node.name.value, parent_type.name),
+        schema=info.schema,
+        fragments=info.fragments,
+        root_value=info.root_value,
+        operation=info.operation,
+        variable_values=info.variable_values,
+        context=info.context,
+        is_awaitable=info.is_awaitable,
+    )
 
 
 def _get_model_hints(
     model: type[models.Model],
     schema: Schema,
     object_definition: StrawberryObjectDefinition,
-    selection: Selection,
     *,
+    parent_type: GraphQLObjectType | GraphQLInterfaceType,
     info: GraphQLResolveInfo,
     config: OptimizerConfig | None = None,
     prefix: str = "",
@@ -368,63 +563,24 @@ def _get_model_hints(
             GenericRelation,
         )
 
-    store = OptimizerStore()
     cache = cache or {}
-    t_name = schema.config.name_converter.from_object(object_definition)
 
     # In case this is a relay field, find the selected edges/nodes, the selected fields
     # are actually inside edges -> node selection...
-    if issubclass(
-        object_definition.origin,
-        relay.Connection,
-    ):
-        # TODO: Connections are mostly used for pagination so it doesn't make sense for
-        # us to optimize those, as our prefetch would be thrown away causing an extra
-        # useless query. Is there a way for us to properly optimize this in the future?
-        if level > 0:
-            return None
+    if issubclass(object_definition.origin, relay.Connection):
+        return _get_model_hints_from_connection(
+            model,
+            schema,
+            object_definition,
+            parent_type=parent_type,
+            info=info,
+            config=config,
+            prefix=prefix,
+            cache=cache,
+            level=level,
+        )
 
-        n_type = object_definition.type_var_map.get("NodeType")
-        if n_type is None:
-            specialized_type_var_map = object_definition.specialized_type_var_map or {}
-
-            n_type = specialized_type_var_map["NodeType"]
-        if isinstance(n_type, LazyType):
-            n_type = n_type.resolve_type()
-
-        n_definition = get_object_definition(n_type, strict=True)
-
-        for edges in get_selections(selection, typename=t_name).values():
-            if edges.name != "edges":
-                continue
-
-            e_definition = get_object_definition(relay.Edge, strict=True)
-            e_type = e_definition.resolve_generic(
-                relay.Edge[cast(Type[relay.Node], n_type)],
-            )
-            e_name = schema.config.name_converter.from_object(
-                get_object_definition(e_type, strict=True),
-            )
-            for node in get_selections(edges, typename=e_name).values():
-                if node.name != "node":
-                    continue
-
-                new_store = _get_model_hints(
-                    model=model,
-                    schema=schema,
-                    object_definition=n_definition,
-                    selection=node,
-                    info=info,
-                    config=config,
-                    prefix=prefix,
-                    cache=cache,
-                    level=level,
-                )
-                if new_store is not None:
-                    store |= new_store
-
-        return store
-
+    store = OptimizerStore()
     fields = {
         schema.config.name_converter.get_graphql_name(f): f
         for f in object_definition.fields
@@ -448,8 +604,9 @@ def _get_model_hints(
     if pk is not None:
         store.only.append(pk.attname)
 
-    for f_selection in get_selections(selection, typename=t_name).values():
-        field = fields.get(f_selection.name, None)
+    for f_selections in _get_selections(info, parent_type).values():
+        f_selection = f_selections[0]
+        field = fields.get(f_selection.name.value, None)
         if not field:
             continue
 
@@ -457,9 +614,20 @@ def _get_model_hints(
         if getattr(field, "disable_optimization", False):
             continue
 
+        field_definition = parent_type.fields[f_selection.name.value].type
+        while isinstance(field_definition, GraphQLWrappingType):
+            field_definition = field_definition.of_type
+
+        f_info = _generate_selection_resolve_info(
+            info,
+            f_selections,
+            field_definition,
+            parent_type,
+        )
+
         # Add annotations from the field if they exist
         field_store = getattr(field, "store", None)
-        if field_store is not None:
+        if field_store:
             if (
                 len(field_store.annotate) == 1
                 and _annotate_placeholder in field_store.annotate
@@ -475,14 +643,20 @@ def _get_model_hints(
                     field.name: field_store.annotate[_annotate_placeholder],
                 }
             store |= (
-                field_store.with_prefix(prefix, info=info) if prefix else field_store
+                field_store.with_prefix(prefix, info=f_info) if prefix else field_store
             )
 
         # Then from the model property if one is defined
         model_attr = getattr(model, field.python_name, None)
-        if model_attr is not None and isinstance(model_attr, ModelProperty):
+        if (
+            model_attr is not None
+            and isinstance(model_attr, ModelProperty)
+            and model_attr.store
+        ):
             attr_store = model_attr.store
-            store |= attr_store.with_prefix(prefix, info=info) if prefix else attr_store
+            store |= (
+                attr_store.with_prefix(prefix, info=f_info) if prefix else attr_store
+            )
 
         # Lastly, from the django field itself
         model_fieldname: str = getattr(field, "django_name", None) or field.python_name
@@ -508,24 +682,21 @@ def _get_model_hints(
                         f_model,
                         schema,
                         f_type_def,
-                        f_selection,
-                        info=info,
+                        parent_type=cast(GraphQLObjectType, field_definition),
+                        info=f_info,
                         config=config,
                         cache=cache,
                         level=level + 1,
                     )
                     if f_store is not None:
                         cache.setdefault(f_model, []).append((level, f_store))
-                        store |= f_store.with_prefix(path, info=info)
+                        store |= f_store.with_prefix(path, info=f_info)
             elif GenericForeignKey and isinstance(model_field, GenericForeignKey):
                 # There's not much we can do to optimize generic foreign keys regarding
                 # only/select_related because they can be anything.
                 # Just prefetch_related them
                 store.prefetch_related.append(model_fieldname)
-            elif isinstance(
-                model_field,
-                _relation_fields,
-            ):
+            elif isinstance(model_field, _relation_fields):
                 f_types = list(get_possible_type_definitions(field.type))
                 if len(f_types) > 1:
                     # This might be a generic foreign key.
@@ -538,14 +709,15 @@ def _get_model_hints(
                         remote_model,
                         schema,
                         f_types[0],
-                        f_selection,
-                        info=info,
+                        parent_type=cast(GraphQLObjectType, field_definition),
+                        info=f_info,
                         config=config,
                         cache=cache,
                         level=level + 1,
                     )
 
                     if f_store is not None:
+                        related_field_id = None
                         if (
                             (config is None or config.enable_only)
                             and f_store.only
@@ -561,9 +733,10 @@ def _get_model_hints(
                                 f_store.only.append(model_field.object_id_field_name)
                                 f_store.only.append(model_field.content_type_field_name)
                             else:
-                                f_store.only.append(
-                                    remote_field.attname or remote_field.name,
+                                related_field_id = (
+                                    remote_field.attname or remote_field.name
                                 )
+                                f_store.only.append(related_field_id)
 
                         path_lookup = f"{path}{LOOKUP_SEP}"
                         if store.only and f_store.only:
@@ -590,21 +763,17 @@ def _get_model_hints(
 
                         cache.setdefault(remote_model, []).append((level, f_store))
 
-                        # If prefetch_custom_queryset is false, use _base_manager here
-                        # instead of _default_manager because we are getting related
-                        # objects, and not querying it directly. Else use the type's
-                        # get_queryset and model's custom QuerySet.
                         base_qs = _get_prefetch_queryset(
                             remote_model,
+                            schema,
                             field,
-                            config,
-                            info,
-                        )
-                        f_qs = f_store.apply(
-                            base_qs,
-                            info=info,
+                            parent_type,
+                            f_selection,
                             config=config,
+                            info=f_info,
+                            related_field_id=related_field_id,
                         )
+                        f_qs = f_store.apply(base_qs, info=f_info, config=config)
                         f_prefetch = Prefetch(path, queryset=f_qs)
                         f_prefetch._optimizer_sentinel = _sentinel  # type: ignore
                         store.prefetch_related.append(f_prefetch)
@@ -622,6 +791,90 @@ def _get_model_hints(
             # something else
             store.only.extend(inner_store.only)
             store.select_related.extend(inner_store.select_related)
+
+    return store
+
+
+def _get_gql_definition(
+    schema: Schema,
+    definition: StrawberryObjectDefinition,
+) -> GraphQLInterfaceType | GraphQLObjectType:
+    if definition.is_interface:
+        return schema.schema_converter.from_interface(definition)
+
+    return schema.schema_converter.from_object(definition)
+
+
+def _get_model_hints_from_connection(
+    model: type[models.Model],
+    schema: Schema,
+    object_definition: StrawberryObjectDefinition,
+    *,
+    parent_type: GraphQLObjectType | GraphQLInterfaceType,
+    info: GraphQLResolveInfo,
+    config: OptimizerConfig | None = None,
+    prefix: str = "",
+    cache: dict[type[models.Model], list[tuple[int, OptimizerStore]]] | None = None,
+    level: int = 0,
+) -> OptimizerStore | None:
+    store = None
+
+    n_type = object_definition.type_var_map.get("NodeType")
+    if n_type is None:
+        specialized_type_var_map = object_definition.specialized_type_var_map or {}
+
+        n_type = specialized_type_var_map["NodeType"]
+
+    if isinstance(n_type, LazyType):
+        n_type = n_type.resolve_type()
+
+    n_definition = get_object_definition(n_type, strict=True)
+
+    for edges in _get_selections(info, parent_type).values():
+        edge = edges[0]
+        if edge.name.value != "edges":
+            continue
+
+        e_definition = get_object_definition(relay.Edge, strict=True)
+        e_type = e_definition.resolve_generic(
+            relay.Edge[cast(Type[relay.Node], n_type)],
+        )
+        e_gql_definition = _get_gql_definition(
+            schema,
+            get_object_definition(e_type, strict=True),
+        )
+        assert isinstance(e_gql_definition, GraphQLObjectType)
+        e_info = _generate_selection_resolve_info(
+            info,
+            edges,
+            e_gql_definition,
+            parent_type,
+        )
+        for nodes in _get_selections(e_info, e_gql_definition).values():
+            node = nodes[0]
+            if node.name.value != "node":
+                continue
+
+            n_gql_definition = _get_gql_definition(schema, n_definition)
+            assert isinstance(n_gql_definition, GraphQLObjectType)
+            n_info = _generate_selection_resolve_info(
+                info,
+                nodes,
+                n_gql_definition,
+                e_gql_definition,
+            )
+
+            store = _get_model_hints(
+                model=model,
+                schema=schema,
+                object_definition=n_definition,
+                parent_type=n_gql_definition,
+                info=n_info,
+                config=config,
+                prefix=prefix,
+                cache=cache,
+                level=level,
+            )
 
     return store
 
@@ -669,10 +922,12 @@ def optimize(
     if isinstance(qs, BaseManager):
         qs = cast(QuerySet[_M], qs.all())
 
+    if isinstance(qs, list):
+        # return sliced queryset as-is
+        return qs
+
     # Avoid optimizing twice and also modify an already resolved queryset
-    if (
-        getattr(qs, "_gql_optimized", False) or qs._result_cache is not None  # type: ignore
-    ):
+    if is_optimized(qs) or qs._result_cache is not None:  # type: ignore
         return qs
 
     if isinstance(info, Info):
@@ -682,7 +937,6 @@ def optimize(
     store = store or OptimizerStore()
     schema = cast(Schema, info.schema._strawberry_schema)  # type: ignore
 
-    field_name = info.field_name
     gql_type = get_named_type(info.return_type)
     strawberry_type = schema.get_type_by_name(gql_type.name)
     if strawberry_type is None:
@@ -709,27 +963,42 @@ def optimize(
         else:
             object_definitions = [object_definition]
 
-        for selection in convert_selections(info, info.field_nodes):
-            if isinstance(selection, InlineFragment) or selection.name != field_name:
-                continue
-
-            for t_definition in object_definitions:
-                new_store = _get_model_hints(
-                    qs.model,
-                    schema,
-                    t_definition,
-                    selection,
-                    info=info,
-                    config=config,
-                )
-                if new_store is not None:
-                    store |= new_store
+        for inner_object_definition in object_definitions:
+            parent_type = _get_gql_definition(schema, inner_object_definition)
+            new_store = _get_model_hints(
+                qs.model,
+                schema,
+                inner_object_definition,
+                parent_type=parent_type,
+                info=info,
+                config=config,
+            )
+            if new_store is not None:
+                store |= new_store
 
     if store:
         qs = store.apply(qs, info=info, config=config)
-        qs._gql_optimized = True  # type: ignore
+        qs_config = get_queryset_config(qs)
+        qs_config.optimized = True
 
     return qs
+
+
+def is_optimized(qs: QuerySet) -> bool:
+    return get_queryset_config(qs).optimized or is_optimized_by_prefetching(qs)
+
+
+def mark_optimized_by_prefetching(qs: QuerySet[_M]) -> QuerySet[_M]:
+    # This is a bit of a hack, but there is no easy way to mark a related manager
+    # as optimized at this phase, so we just add a mark to the queryset that
+    # we can check leater on using is_optimized_by_prefetching
+    return qs.annotate(**{
+        NESTED_PREFETCH_MARK: models.Value(True),
+    })
+
+
+def is_optimized_by_prefetching(qs: QuerySet) -> bool:
+    return NESTED_PREFETCH_MARK in qs.query.annotations
 
 
 optimizer: contextvars.ContextVar[DjangoOptimizerExtension | None] = (
@@ -751,6 +1020,12 @@ class DjangoOptimizerExtension(SchemaExtension):
             Enable `QuerySet.select_related` optimizations
         enable_prefetch_related_optimization:
             Enable `QuerySet.prefetch_related` optimizations
+        enable_nested_relations_prefetch:
+            Enable prefetch of nested relations. This will allow for nested
+            relations to be prefetched even when using filters/ordering/pagination.
+            Note however that for connections, it will only work when for the
+            `ListConnection` and `ListConnectionWithTotalCount` types, as this optimization
+            is not safe to be applied automatically for custom connections.
         enable_annotate_optimization:
             Enable `QuerySet.annotate` optimizations
 
@@ -782,6 +1057,7 @@ class DjangoOptimizerExtension(SchemaExtension):
         enable_select_related_optimization: bool = True,
         enable_prefetch_related_optimization: bool = True,
         enable_annotate_optimization: bool = True,
+        enable_nested_relations_prefetch: bool = True,
         execution_context: ExecutionContext | None = None,
         prefetch_custom_queryset: bool = False,
     ):
@@ -790,6 +1066,7 @@ class DjangoOptimizerExtension(SchemaExtension):
         self.enable_select_related = enable_select_related_optimization
         self.enable_prefetch_related = enable_prefetch_related_optimization
         self.enable_annotate_optimization = enable_annotate_optimization
+        self.enable_nested_relations_prefetch = enable_nested_relations_prefetch
         self.prefetch_custom_queryset = prefetch_custom_queryset
 
     def on_execute(self) -> Generator[None, None, None]:
@@ -823,6 +1100,7 @@ class DjangoOptimizerExtension(SchemaExtension):
                 enable_prefetch_related=self.enable_prefetch_related,
                 enable_annotate=self.enable_annotate_optimization,
                 prefetch_custom_queryset=self.prefetch_custom_queryset,
+                enable_nested_relations_prefetch=self.enable_nested_relations_prefetch,
             )
             ret = django_fetch(optimize(qs=ret, info=info, config=config))
 

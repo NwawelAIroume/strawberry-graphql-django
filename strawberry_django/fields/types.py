@@ -30,6 +30,7 @@ from strawberry.scalars import JSON
 from strawberry.utils.str_converters import capitalize_first, to_camel_case
 
 from strawberry_django import filters
+from strawberry_django.fields import filter_types
 from strawberry_django.settings import strawberry_django_settings as django_settings
 
 try:
@@ -457,7 +458,7 @@ def resolve_model_field_type(
                 choice_value = EnumValueDefinition(value=c[0], description=str(c[1]))
 
                 while choice_name in enum_choices:
-                    choice_name = choice_name + "_"
+                    choice_name += "_"
                 enum_choices[choice_name] = choice_value
 
             field_type = strawberry.enum(  # type: ignore
@@ -487,7 +488,9 @@ def resolve_model_field_type(
 
         if django_type.is_filter and model_field.is_relation:
             field_type = (
-                NodeInput if force_global_id else filters.DjangoModelFilterInput
+                NodeInput
+                if force_global_id
+                else filters.get_django_model_filter_input_type()
             )
         elif django_type.is_input:
             input_type_map = input_field_type_map
@@ -509,25 +512,32 @@ def resolve_model_field_type(
         )
 
     # TODO: could this be moved into filters.py
+    using_old_filters = settings["USE_DEPRECATED_FILTERS"]
     if (
         django_type.is_filter == "lookups"
         and not model_field.is_relation
-        and field_type is not bool
+        and (field_type is not bool or not using_old_filters)
     ):
-        field_type = filters.FilterLookup[field_type]
+        if using_old_filters:
+            field_type = filters.FilterLookup[field_type]
+        else:
+            field_type = filter_types.type_filter_map.get(  # type: ignore
+                field_type, filter_types.FilterLookup
+            )[field_type]
 
     return field_type
 
 
 def resolve_model_field_name(
     model_field: Union[Field, reverse_related.ForeignObjectRel],
-    is_input=False,
-    is_filter=False,
+    is_input: bool = False,
+    is_filter: bool = False,
+    is_fk_id: bool = False,
 ):
     if isinstance(model_field, reverse_related.ForeignObjectRel):
         return model_field.get_accessor_name()
 
-    if is_input and not is_filter:
+    if is_fk_id or (is_input and not is_filter):
         return model_field.attname
 
     return model_field.name

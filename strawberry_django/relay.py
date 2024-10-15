@@ -19,7 +19,8 @@ from django.db import models
 from strawberry import relay
 from strawberry.relay.exceptions import NodeIDAnnotationError
 from strawberry.relay.types import NodeIterableType
-from strawberry.type import StrawberryContainer, get_object_definition
+from strawberry.types import get_object_definition
+from strawberry.types.base import StrawberryContainer
 from strawberry.types.info import Info
 from strawberry.utils.await_maybe import AwaitableOrValue
 from typing_extensions import Literal, Self
@@ -186,12 +187,12 @@ class ListConnectionWithTotalCount(relay.ListConnection[relay.NodeType]):
             )
             for node in result
         ]
-        has_previous_page = (
-            nodes[0]._strawberry_row_number > 1  # type: ignore
+        has_previous_page = result[0]._strawberry_row_number > 1 if result else False
+        has_next_page = (
+            result[-1]._strawberry_row_number < result[-1]._strawberry_total_count
             if result
             else False
         )
-        has_next_page = result._strawberry_row_number < result if result else False
 
         return cls(
             edges=edges,

@@ -3,6 +3,7 @@ import contextlib
 import contextvars
 import dataclasses
 import inspect
+import warnings
 from typing import Any, Dict, Optional, Union
 
 import strawberry
@@ -14,6 +15,7 @@ from django.test.client import (
 from django.test.utils import CaptureQueriesContext
 from strawberry.test.client import Response
 from strawberry.utils.inspect import in_async_context
+from typing_extensions import override
 
 from strawberry_django.optimizer import DjangoOptimizerExtension
 from strawberry_django.test.client import TestClient
@@ -97,8 +99,9 @@ def assert_num_queries(n: int, *, using=DEFAULT_DB_ALIAS):
     # FIXME: Async will not have access to the correct number of queries without
     # execing CaptureQueriesContext.(__enter__|__exit__) wrapped in sync_to_async
     # How can we fix this?
-    if _client.get().is_async and executed == 0:
-        return
+    with contextlib.suppress(LookupError):
+        if _client.get().is_async and executed == 0:
+            return
 
     assert (
         executed == n
@@ -146,13 +149,15 @@ class GraphQLTestClient(TestClient):
             **kwargs,  # type: ignore
         )
 
+    @override
     def query(
         self,
         query: str,
         variables: Optional[Dict[str, Any]] = None,
         headers: Optional[Dict[str, object]] = None,
-        asserts_errors: Optional[bool] = True,
+        asserts_errors: Optional[bool] = None,
         files: Optional[Dict[str, object]] = None,
+        assert_no_errors: Optional[bool] = True,
     ) -> Response:
         body = self._build_body(query, variables, files)
 
@@ -167,7 +172,18 @@ class GraphQLTestClient(TestClient):
             data=data.get("data"),
             extensions=data.get("extensions"),
         )
-        if asserts_errors:
-            assert response.errors is None, response.errors
+
+        if asserts_errors is not None:
+            warnings.warn(
+                "The `asserts_errors` argument has been renamed to `assert_no_errors`",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
+        assert_no_errors = (
+            assert_no_errors if asserts_errors is None else asserts_errors
+        )
+        if assert_no_errors:
+            assert response.errors is None
 
         return response

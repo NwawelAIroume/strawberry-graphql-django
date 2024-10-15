@@ -96,6 +96,7 @@ type IssueType implements Node & Named {
   nameWithKind: String!
   tags: [TagType!]!
   issueAssignees: [AssigneeType!]!
+  staffAssignees: [StaffType!]!
   favoriteSet(
     """Returns the items in the list that come before the specified cursor."""
     before: String = null
@@ -162,7 +163,6 @@ type MilestoneType implements Node & Named {
   dueDate: Date
   project: ProjectType!
   issues(filters: IssueFilter, order: IssueOrder, pagination: OffsetPaginationInput): [IssueType!]!
-  myIssues: [IssueType!]!
   issuesWithFilters(
     filters: IssueFilter
 
@@ -178,6 +178,7 @@ type MilestoneType implements Node & Named {
     """Returns the items in the list that come after the specified cursor."""
     last: Int = null
   ): IssueTypeConnection!
+  myIssues: [IssueType!]!
   myBugsCount: Int!
   asyncField(value: String!): String!
 }
@@ -189,7 +190,6 @@ type MilestoneTypeSubclass implements Node & Named {
   dueDate: Date
   project: ProjectType!
   issues(filters: IssueFilter, order: IssueOrder, pagination: OffsetPaginationInput): [IssueType!]!
-  myIssues: [IssueType!]!
   issuesWithFilters(
     filters: IssueFilter
 
@@ -205,6 +205,7 @@ type MilestoneTypeSubclass implements Node & Named {
     """Returns the items in the list that come after the specified cursor."""
     last: Int = null
   ): IssueTypeConnection!
+  myIssues: [IssueType!]!
   myBugsCount: Int!
   asyncField(value: String!): String!
 }
@@ -296,7 +297,7 @@ type ProjectType implements Node & Named {
   id: GlobalID!
   name: String!
   dueDate: Date
-  milestones(filters: MilestoneFilter, order: MilestoneOrder): [MilestoneType!]!
+  milestones(filters: MilestoneFilter, order: MilestoneOrder, pagination: OffsetPaginationInput): [MilestoneType!]!
   milestonesCount: Int!
   isDelayed: Boolean!
   cost: Decimal @isAuthenticated
@@ -308,7 +309,7 @@ type ProjectTypeSubclass implements Node & Named {
   id: GlobalID!
   name: String!
   dueDate: Date
-  milestones(filters: MilestoneFilter, order: MilestoneOrder): [MilestoneType!]!
+  milestones(filters: MilestoneFilter, order: MilestoneOrder, pagination: OffsetPaginationInput): [MilestoneType!]!
   milestonesCount: Int!
   isDelayed: Boolean!
   cost: Decimal @isAuthenticated
@@ -324,6 +325,15 @@ type Query {
     """The ID of the object."""
     id: GlobalID!
   ): MilestoneTypeSubclass
+}
+
+type StaffType implements Node {
+  """The Globally Unique ID of this object"""
+  id: GlobalID!
+  email: String!
+  isActive: Boolean!
+  isSuperuser: Boolean!
+  isStaff: Boolean!
 }
 
 input StrFilterLookup {

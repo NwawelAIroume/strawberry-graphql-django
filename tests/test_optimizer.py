@@ -1325,3 +1325,103 @@ def test_nested_prefetch_with_multiple_levels(db, gql_client: GraphQLTestClient)
             "issues": expected_issues,
         },
     }
+
+
+@pytest.mark.django_db(transaction=True)
+def test_nested_prefetch_with_get_queryset(
+    db,
+    gql_client: GraphQLTestClient,
+    mocker: MockerFixture,
+):
+    mock_get_queryset = mocker.spy(StaffType, "get_queryset")
+
+    query = """
+      query TestQuery ($id: GlobalID!) {
+        issue(id: $id) {
+          id
+          staffAssignees {
+            id
+          }
+        }
+      }
+    """
+
+    issue = IssueFactory.create()
+    user = UserFactory.create()
+    staff = StaffUserFactory.create()
+    for u in [user, staff]:
+        Assignee.objects.create(user=u, issue=issue)
+
+    res = gql_client.query(
+        query,
+        {"id": to_base64("IssueType", issue.pk)},
+    )
+
+    assert isinstance(res.data, dict)
+    assert res.data == {
+        "issue": {
+            "id": to_base64("IssueType", issue.pk),
+            "staffAssignees": [{"id": to_base64("StaffType", staff.username)}],
+        },
+    }
+    mock_get_queryset.assert_called_once()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_prefetch_hint_with_same_name_field_no_extra_queries(
+    db,
+):
+    @strawberry_django.type(Issue)
+    class IssueType:
+        pk: strawberry.ID
+
+    @strawberry_django.type(Milestone)
+    class MilestoneType:
+        pk: strawberry.ID
+
+        @strawberry_django.field(
+            prefetch_related=[
+                lambda info: Prefetch(
+                    "issues",
+                    queryset=Issue.objects.filter(name__startswith="Foo"),
+                    to_attr="_my_issues",
+                ),
+            ],
+        )
+        def issues(self) -> List[IssueType]:
+            return self._my_issues  # type: ignore
+
+    @strawberry.type
+    class Query:
+        milestone: MilestoneType = strawberry_django.field()
+
+    schema = strawberry.Schema(query=Query, extensions=[DjangoOptimizerExtension])
+
+    milestone1 = MilestoneFactory.create()
+    milestone2 = MilestoneFactory.create()
+
+    issue1 = IssueFactory.create(name="Foo", milestone=milestone1)
+    IssueFactory.create(name="Bar", milestone=milestone1)
+    IssueFactory.create(name="Foo", milestone=milestone2)
+
+    query = """\
+      query TestQuery ($pk: ID!) {
+        milestone(pk: $pk) {
+          pk
+          issues {
+            pk
+          }
+        }
+      }
+    """
+
+    with assert_num_queries(2):
+        res = schema.execute_sync(query, {"pk": milestone1.pk})
+
+    assert res.errors is None
+    assert res.data == {
+        "milestone": {
+            "pk": str(milestone1.pk),
+            "issues": [{"pk": str(issue1.pk)}],
+        },
+    }
